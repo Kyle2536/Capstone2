@@ -1,0 +1,297 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Traffic Dashboard (enhanced)</title>
+  <script src="https://code.highcharts.com/highcharts.js"></script>
+  <script src="https://code.highcharts.com/modules/exporting.js"></script>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 0; padding: 16px; }
+    .row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+    .pill { background:#f2f2f2; padding:6px 10px; border-radius:999px; font-size:12px; }
+    .btn  { padding:6px 10px; border-radius:8px; border:1px solid #ddd; background:#fff; cursor:pointer; }
+    .grid { display: grid; grid-template-columns: 2fr 1fr; grid-template-rows: auto auto; gap: 16px; }
+    .full { grid-column: 1 / -1; }
+  </style>
+</head>
+<body>
+  <div class="row" style="justify-content:space-between">
+    <h2 style="margin:0;">Traffic Dashboard (enhanced)</h2>
+    <div class="row">
+      <button id="pauseBtn"  class="btn">⏸️ Pause</button>
+      <button id="resumeBtn" class="btn">▶️ Resume</button>
+      <span id="status" class="pill">init…</span>
+      <span id="since" class="pill">sinceId=0</span>
+      <span id="count" class="pill">points=0</span>
+    </div>
+  </div>
+
+  <div class="grid" style="margin-top:12px;">
+    <div id="speedChart" class="full" style="height: 380px;"></div>
+    <div id="volChart"               style="height: 180px;"></div>
+    <div id="directionChart"         style="height: 280px;"></div>
+    <div id="speedingChart"          style="height: 280px;"></div>
+    <div id="speedDistribution" class="full" style="height: 260px;"></div>
+  </div>
+
+  <script>
+    // =======================
+    // Config
+    // =======================
+    const API_HEAD   = '/api/head';
+    const API_LATEST = '/api/latest';
+    const API_ACK    = '/latency/ack-bulk';
+
+    const POLL_MS       = 350;       // UI fetch cadence (near-real-time)
+    const MAX_POINTS    = 1000;      // keep only the latest 1000 speed samples
+    const VOL_WINDOW_MIN= 15;        // rows/min window
+    const SPEEDING_THRESHOLD = 40;   // mph threshold for speeding pie
+
+    // =======================
+    // Utilities
+    // =======================
+    const $id = (x) => document.getElementById(x);
+    const fmtInt = (x) => Math.round(Number(x) || 0);
+    const floorToMinute = (tsMs) => Math.floor(tsMs / 60000) * 60000;
+
+    // =======================
+    // Charts
+    // =======================
+    const speedChart = Highcharts.chart('speedChart', {
+      chart: { type: 'spline', animation: false },
+      title: { text: 'Peak Speed (mph)' },
+      xAxis: { type: 'datetime', tickPixelInterval: 150 },
+      yAxis: {
+        title: { text: 'mph' }, min: 0,
+        labels: { formatter: function(){ return Math.round(this.value); } }
+      },
+      legend: { enabled: false },
+      tooltip: {
+        shared: false,
+        formatter: function () {
+          const t = new Date(this.x).toLocaleString();
+          return `<b>${t}</b><br/>peakspeed: <b>${fmtInt(this.y)}</b>`;
+        }
+      },
+      plotOptions: { series: { turboThreshold: 0, marker: { enabled: false } } },
+      series: [{ name: 'peakspeed', data: [] }],
+      credits: { enabled: false }
+    });
+
+    const volChart = Highcharts.chart('volChart', {
+      chart: { type: 'column', animation: false },
+      title: { text: 'Rows per minute (latest 15 min)' },
+      xAxis: { type: 'datetime' },
+      yAxis: { title: { text: 'rows/min' }, min: 0, allowDecimals: false },
+      legend: { enabled: false },
+      tooltip: { pointFormatter: function(){ return `rows: <b>${fmtInt(this.y)}</b>`; } },
+      series: [{ name: 'rows/min', data: [] }],
+      credits: { enabled: false }
+    });
+
+    const directionChart = Highcharts.chart('directionChart', {
+      chart: { type: 'pie', animation: false },
+      title: { text: 'Direction Split' },
+      series: [{ name: 'Vehicles', colorByPoint: true, data: [
+        { name: 'Northbound', y: 0 },
+        { name: 'Southbound', y: 0 }
+      ]}],
+      tooltip: { pointFormat: '<b>{point.y}</b>' },
+      credits: { enabled: false }
+    });
+
+    const speedingChart = Highcharts.chart('speedingChart', {
+      chart: { type: 'pie', animation: false },
+      title: { text: `Speeding (>${SPEEDING_THRESHOLD} mph)` },
+      series: [{ name: 'Vehicles', colorByPoint: true, data: [
+        { name: 'Speeding', y: 0, color: '#DF5353' },
+        { name: 'Within Limit', y: 0, color: '#55BF3B' }
+      ]}],
+      tooltip: { pointFormat: '<b>{point.y} ({point.percentage:.1f}%)</b>' },
+      credits: { enabled: false }
+    });
+
+    const bins = ["0–10","11–20","21–30","31–40","41–50","51–60","61–70","71–80","81–90","91–100"];
+    const speedDistribution = Highcharts.chart('speedDistribution', {
+      chart: { type: 'column', animation: false },
+      title: { text: 'Speed Distribution (10-mph bins, latest 1000)' },
+      xAxis: { categories: bins, title: { text: 'Speed Range (mph)' }},
+      yAxis: { title: { text: 'Vehicle Count' }, min: 0, allowDecimals: false },
+      legend: { enabled: false },
+      tooltip: { pointFormatter: function(){ return `rows: <b>${fmtInt(this.y)}</b>`; } },
+      series: [{ name: 'Vehicles', data: new Array(bins.length).fill(0) }],
+      credits: { enabled: false }
+    });
+
+    function trimSeries(series, maxPoints) {
+      const extra = series.data.length - maxPoints;
+      if (extra > 0) {
+        for (let i = 0; i < extra; i++) series.data[0].remove(false);
+        series.chart.redraw();
+      }
+    }
+
+    // =======================
+    // Streaming state
+    // =======================
+    let sinceId = 0;
+    let inflight = false;
+    let running = true;
+
+    // rolling rows/min counter
+    const perMinute = new Map();
+
+    function updateVolume(points) {
+      const now = Date.now();
+      const cutoff = now - VOL_WINDOW_MIN*60000;
+      for (const p of points) {
+        const m = floorToMinute(p.tsMs);
+        perMinute.set(m, (perMinute.get(m) || 0) + 1);
+      }
+      for (const k of perMinute.keys()) if (k < cutoff) perMinute.delete(k);
+      const keys = Array.from(perMinute.keys()).sort((a,b)=>a-b).filter(k => k >= cutoff);
+      const data = keys.map(k => [k, perMinute.get(k)]);
+      volChart.series[0].setData(data, true, { duration: 0 });
+    }
+
+    function recomputeSecondaryFromSeries() {
+      // Recompute direction, speeding, and histogram from the last up-to-1000 speed points in the series.
+      const s = speedChart.series[0];
+      let north = 0, south = 0, speeding = 0, total = 0;
+      const hist = new Array(bins.length).fill(0);
+
+      // We don't have direction in the speed series points. So we’ll accumulate direction/speeding from the *last fetch batch* (see pump()).
+      // To keep this self-contained, we store a small ring buffer of the last N rows with direction for analytics:
+    }
+
+    // keep a small buffer of last 1000 raw rows (timestamp, mph, direction)
+    const lastRows = [];
+    function pushRows(rows) {
+      for (const r of rows) lastRows.push(r);
+      const extra = lastRows.length - MAX_POINTS;
+      if (extra > 0) lastRows.splice(0, extra);
+    }
+
+    function updateSecondaryFromLastRows() {
+      let north = 0, south = 0, speeding = 0;
+      const hist = new Array(bins.length).fill(0);
+      for (const r of lastRows) {
+        // r: { tsMs, mph, direction }
+        if (r.direction === 1) north++; else south++;
+        if (r.mph > SPEEDING_THRESHOLD) speeding++;
+        const idx = Math.max(0, Math.min(9, Math.floor(r.mph / 10)));
+        hist[idx]++;
+      }
+      // direction
+      directionChart.series[0].setData([
+        { name: 'Northbound', y: north },
+        { name: 'Southbound', y: south }
+      ], true);
+      // speeding
+      const within = Math.max(0, lastRows.length - speeding);
+      speedingChart.series[0].setData([
+        { name: 'Speeding', y: speeding, color: '#DF5353' },
+        { name: 'Within Limit', y: within, color: '#55BF3B' }
+      ], true);
+      // histogram
+      speedDistribution.series[0].setData(hist, true, { duration: 0 });
+    }
+
+    // =======================
+    // API helpers
+    // =======================
+    async function getHead() {
+      const r = await fetch(API_HEAD);
+      const j = await r.json();
+      return Number(j.head || 0);
+    }
+
+    async function fetchLatest(since, limit=800) {
+      const r = await fetch(`${API_LATEST}?sinceId=${since}&limit=${limit}`);
+      return await r.json();
+    }
+
+    async function postAck(traceIds) {
+      if (!traceIds.length) return;
+      try {
+        await fetch(API_ACK, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ acks: traceIds.map(t => ({ trace_id: t })) })
+        });
+      } catch (_) {}
+    }
+
+    // =======================
+    // Pump loop
+    // =======================
+    async function pump() {
+      if (!running || inflight) return;
+      inflight = true;
+      try {
+        const out = await fetchLatest(sinceId, 800);
+        const rows = out.rows || [];
+        let maxId = out.maxId || sinceId;
+
+        if (rows.length) {
+          const s = speedChart.series[0];
+          const acks = [];
+          const volPoints = [];
+          const enriched = [];
+
+          for (const r of rows) {
+            // r fields expected from /api/latest: { trace_id, sensor_created_at, peakspeed, direction, ... }
+            const ts = Date.parse(r.sensor_created_at);
+            const mph = fmtInt(r.peakspeed);                 // integer mph
+            s.addPoint([ts, mph], false);                    // defer redraw
+            volPoints.push({ tsMs: ts });
+            acks.push(r.trace_id);
+            
+            // robust direction normalize: accept direction/dir/Direction and strings
+            const rawDir = r.direction ?? r.dir ?? r.Direction ?? 0;
+            const dirNum = Number(rawDir);
+            // normalize to 0/1 only (treat anything other than 1 as 0)
+            const dir = (dirNum === 1) ? 1 : 0;
+            enriched.push({ tsMs: ts, mph, direction: dir });
+          }
+
+          speedChart.redraw();
+          trimSeries(s, MAX_POINTS);
+          $id('count').textContent = `points=${s.data.length}`;
+
+          // update secondary analytics
+          pushRows(enriched);
+          updateVolume(volPoints);
+          updateSecondaryFromLastRows();
+
+          await postAck(acks);
+        }
+
+        sinceId = Math.max(sinceId, maxId);
+        $id('since').textContent = `sinceId=${sinceId}`;
+        $id('status').textContent = `ok +${rows.length}`;
+      } catch (e) {
+        $id('status').textContent = 'error';
+        console.error(e);
+      } finally {
+        inflight = false;
+      }
+    }
+
+    (async function init() {
+      try {
+        sinceId = await getHead();
+        $id('since').textContent = `sinceId=${sinceId}`;
+        $id('status').textContent = 'tailing…';
+      } catch {
+        $id('status').textContent = 'head?';
+      }
+      setInterval(pump, POLL_MS);
+    })();
+
+    // Pause / Resume
+    $id('pauseBtn').addEventListener('click', () => { running = false; $id('status').textContent = 'paused'; });
+    $id('resumeBtn').addEventListener('click', () => { running = true;  $id('status').textContent = 'tailing…'; });
+  </script>
+</body>
+</html>
