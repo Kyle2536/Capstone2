@@ -20,6 +20,7 @@
     <div class="row">
       <button id="pauseBtn"  class="btn">⏸️ Pause</button>
       <button id="resumeBtn" class="btn">▶️ Resume</button>
+      <button id="toggleTypeBtn" class="btn">🔀 Line/Scatter</button>
       <span id="status" class="pill">init…</span>
       <span id="since" class="pill">sinceId=0</span>
       <span id="count" class="pill">points=0</span>
@@ -42,10 +43,10 @@
     const API_LATEST = '/api/latest';
     const API_ACK    = '/latency/ack-bulk';
 
-    const POLL_MS       = 350;       // UI fetch cadence (near-real-time)
-    const MAX_POINTS    = 1000;      // keep only the latest 1000 speed samples
-    const VOL_WINDOW_MIN= 15;        // rows/min window
-    const SPEEDING_THRESHOLD = 40;   // mph threshold for speeding pie
+    const POLL_MS        = 100;       // UI fetch cadence
+    const MAX_POINTS     = 1000;      // keep latest N points
+    const VOL_WINDOW_MIN = 15;        // rows/min window
+    const SPEEDING_THRESHOLD = 40;    // mph threshold for speeding pie
 
     // =======================
     // Utilities
@@ -131,6 +132,16 @@
       }
     }
 
+    // Fit x-axis to current data (min x .. max x). Optional pad on the right.
+    function fitToDataWindow(padMs = 0) {
+      const s = speedChart.series?.[0];
+      const xs = s?.xData;
+      if (!xs || xs.length < 2) return;
+      const min = xs[0] - 0;
+      const max = xs[xs.length - 1] + padMs;
+      speedChart.xAxis[0].setExtremes(min, max, false);
+    }
+
     // =======================
     // Streaming state
     // =======================
@@ -154,16 +165,6 @@
       volChart.series[0].setData(data, true, { duration: 0 });
     }
 
-    function recomputeSecondaryFromSeries() {
-      // Recompute direction, speeding, and histogram from the last up-to-1000 speed points in the series.
-      const s = speedChart.series[0];
-      let north = 0, south = 0, speeding = 0, total = 0;
-      const hist = new Array(bins.length).fill(0);
-
-      // We don't have direction in the speed series points. So we’ll accumulate direction/speeding from the *last fetch batch* (see pump()).
-      // To keep this self-contained, we store a small ring buffer of the last N rows with direction for analytics:
-    }
-
     // keep a small buffer of last 1000 raw rows (timestamp, mph, direction)
     const lastRows = [];
     function pushRows(rows) {
@@ -176,24 +177,20 @@
       let north = 0, south = 0, speeding = 0;
       const hist = new Array(bins.length).fill(0);
       for (const r of lastRows) {
-        // r: { tsMs, mph, direction }
         if (r.direction === 1) north++; else south++;
         if (r.mph > SPEEDING_THRESHOLD) speeding++;
         const idx = Math.max(0, Math.min(9, Math.floor(r.mph / 10)));
         hist[idx]++;
       }
-      // direction
       directionChart.series[0].setData([
         { name: 'Northbound', y: north },
         { name: 'Southbound', y: south }
       ], true);
-      // speeding
       const within = Math.max(0, lastRows.length - speeding);
       speedingChart.series[0].setData([
         { name: 'Speeding', y: speeding, color: '#DF5353' },
         { name: 'Within Limit', y: within, color: '#55BF3B' }
       ], true);
-      // histogram
       speedDistribution.series[0].setData(hist, true, { duration: 0 });
     }
 
@@ -233,33 +230,52 @@
         const rows = out.rows || [];
         let maxId = out.maxId || sinceId;
 
+        // Sort by event time, then record_id for stability
+        rows.sort((a, b) => {
+          const ta = Date.parse(a.sensor_created_at || 0);
+          const tb = Date.parse(b.sensor_created_at || 0);
+          if (ta !== tb) return ta - tb;
+          return (a.record_id || 0) - (b.record_id || 0);
+        });
+
         if (rows.length) {
-          const s = speedChart.series[0];
+          const s = (speedChart && speedChart.series && speedChart.series[0]) ? speedChart.series[0] : null;
+          if (!s) { console.warn('[dashboard] speed series not ready yet'); inflight = false; return; }
+
+          let lastX = (Array.isArray(s.xData) && s.xData.length) ? s.xData[s.xData.length - 1] : -Infinity;
+
           const acks = [];
           const volPoints = [];
           const enriched = [];
 
           for (const r of rows) {
-            // r fields expected from /api/latest: { trace_id, sensor_created_at, peakspeed, direction, ... }
             const ts = Date.parse(r.sensor_created_at);
-            const mph = fmtInt(r.peakspeed);                 // integer mph
-            s.addPoint([ts, mph], false);                    // defer redraw
+            if (!Number.isFinite(ts)) { console.warn('[dashboard] bad timestamp', r); continue; }
+
+            // Keep x strictly increasing
+            let x = ts;
+            if (x <= lastX) x = lastX + 1;
+
+            const y = fmtInt(r.peakspeed);
+
+            const curLen = (Array.isArray(s.data) ? s.data.length : 0);
+            const shift = curLen >= MAX_POINTS;
+            s.addPoint([x, y], false, shift);
+            lastX = x;
+
             volPoints.push({ tsMs: ts });
             acks.push(r.trace_id);
-            
-            // robust direction normalize: accept direction/dir/Direction and strings
+
             const rawDir = r.direction ?? r.dir ?? r.Direction ?? 0;
-            const dirNum = Number(rawDir);
-            // normalize to 0/1 only (treat anything other than 1 as 0)
-            const dir = (dirNum === 1) ? 1 : 0;
-            enriched.push({ tsMs: ts, mph, direction: dir });
+            const dir = (Number(rawDir) === 1) ? 1 : 0;
+            enriched.push({ tsMs: ts, mph: y, direction: dir });
           }
 
           speedChart.redraw();
           trimSeries(s, MAX_POINTS);
-          $id('count').textContent = `points=${s.data.length}`;
+          fitToDataWindow(0);                    // <— x-axis = [min x, max x]
+          $id('count').textContent = `points=${Array.isArray(s.data) ? s.data.length : 0}`;
 
-          // update secondary analytics
           pushRows(enriched);
           updateVolume(volPoints);
           updateSecondaryFromLastRows();
@@ -292,6 +308,19 @@
     // Pause / Resume
     $id('pauseBtn').addEventListener('click', () => { running = false; $id('status').textContent = 'paused'; });
     $id('resumeBtn').addEventListener('click', () => { running = true;  $id('status').textContent = 'tailing…'; });
+
+    // Line ↔ Scatter toggle
+    $id('toggleTypeBtn').addEventListener('click', () => {
+      const series = speedChart.series[0];
+      const isLine = (series.type === 'spline' || series.type === 'line');
+      series.update({
+        type: isLine ? 'scatter' : 'spline',
+        lineWidth: isLine ? 0 : 2,
+        marker: { enabled: true }
+      }, false);
+      speedChart.redraw();
+      fitToDataWindow(0);
+    });
   </script>
 </body>
 </html>

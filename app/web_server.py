@@ -76,32 +76,31 @@ def add_no_cache(resp):
 def api_latest():
     since_id = int(request.args.get("sinceId", 0))
     limit = int(request.args.get("limit", 500))
+
     rows = []
     max_id = since_id
 
-    # Include direction (forced to integer) and any other columns you want on the client.
+    # include direction & record_id; sort by time then id
     sql = f"""
       SELECT
-        l.record_id,
-        l.trace_id,
-        l.run_id,
-        l.sensor_created_at,
-        p.pmgid,
-        p.peakspeed,
-        (p.direction + 0) AS direction,   -- ensure 0/1 numeric
-        p.vehiclecount,
-        p.location
+         l.record_id,
+         l.trace_id,
+         l.run_id,
+         l.sensor_created_at,
+         p.peakspeed,
+         (p.direction + 0) AS direction,   -- force 0/1 numeric for JS
+         p.vehiclecount
       FROM {LATENCY_TABLE} l
       JOIN {BUSINESS_TABLE} p
         ON p.record_id = l.record_id
       WHERE l.record_id > %s
-      ORDER BY l.record_id ASC
+      ORDER BY l.sensor_created_at ASC, l.record_id ASC
       LIMIT %s
     """
 
     with get_conn() as conn:
         with conn.cursor() as cur:
-            # Force UTC from server to keep timestamps consistent
+            # Force UTC to keep timestamps consistent
             cur.execute("SET time_zone = '+00:00'")
             cur.execute(sql, (since_id, limit))
             rows = cur.fetchall()
@@ -119,23 +118,16 @@ def api_latest():
                 conn.commit()
                 max_id = max(r["record_id"] for r in rows)
 
-    # Convert timestamps to ISO UTC for JS
+    # Convert timestamps to ISO UTC for JS (avoid JSON serialization errors)
     for r in rows:
-        if r.get("sensor_created_at"):
-            r["sensor_created_at"] = (
-                r["sensor_created_at"]
-                .replace(tzinfo=timezone.utc)
-                .isoformat(timespec="milliseconds")
-            )
-        # Defensive: if any adapter still returns direction as None/str, coerce to 0/1
-        d = r.get("direction", 0)
-        try:
-            r["direction"] = 1 if int(d) == 1 else 0
-        except Exception:
-            r["direction"] = 0
+        ts = r.get("sensor_created_at")
+        if ts:
+            # ensure tz-aware ISO string with millis
+            r["sensor_created_at"] = ts.replace(tzinfo=timezone.utc).isoformat(timespec="milliseconds")
 
     log(f"[latest] sinceId={since_id} -> returned={len(rows)} maxId={max_id}")
     return jsonify({"rows": rows, "maxId": max_id})
+
 
 
 # ---------------------------------------------------------------------

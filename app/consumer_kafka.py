@@ -1,4 +1,4 @@
-# consumer_kafka.py  — fast, safe, and quiet
+# consumer_kafka.py — LIVE profile (small, frequent flushes) but env-tunable
 import os, json, time, signal, sys
 from datetime import datetime, timezone
 from typing import List, Dict
@@ -28,19 +28,23 @@ BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP", "127.0.0.1:9092")
 TOPIC     = os.getenv("KAFKA_TOPIC", "traffic.raw.v2")
 GROUP     = os.getenv("KAFKA_GROUP", "kafka-rush-consumer")
 
-# Tuning knobs
-MAX_POLL_RECORDS = int(os.getenv("MAX_POLL_RECORDS", "1000"))   # ↑ for bigger fetches
-FETCH_MAX_WAIT_MS = int(os.getenv("FETCH_MAX_WAIT_MS", "50"))   # 0–100ms is snappy
-POLL_TIMEOUT_MS   = int(os.getenv("POLL_TIMEOUT_MS", "200"))    # main loop poll timeout
+# LIVE-ish defaults; override via env if you want larger batches
+MAX_POLL_RECORDS = int(os.getenv("MAX_POLL_RECORDS", "200"))   # smaller fetches → smoother UI
+FETCH_MIN_BYTES  = int(os.getenv("FETCH_MIN_BYTES", "1"))      # return asap, even for tiny payloads
+FETCH_MAX_WAIT_MS= int(os.getenv("FETCH_MAX_WAIT_MS", "50"))   # don't linger waiting to coalesce
+POLL_TIMEOUT_MS  = int(os.getenv("POLL_TIMEOUT_MS", "150"))    # main loop poll timeout
 
-BATCH_ROWS = int(os.getenv("BATCH_ROWS", "1000"))                # flush when buffer this big
-FLUSH_MS   = int(os.getenv("FLUSH_MS", "500"))                   # or every N ms if traffic
+BATCH_ROWS = int(os.getenv("BATCH_ROWS", "200"))               # flush to DB when buffer hits this
+FLUSH_MS   = int(os.getenv("FLUSH_MS", "300"))                 # or every N ms (monotonic), whichever first
 
 # Optional: exit if nothing arrives for a while (keeps CLI runs from hanging forever)
-AUTO_EXIT_IDLE_S = int(os.getenv("AUTO_EXIT_IDLE_S", "0"))       # 0 = never auto-exit
+AUTO_EXIT_IDLE_S = int(os.getenv("AUTO_EXIT_IDLE_S", "0"))     # 0 = never auto-exit
 
-# Logging
-LOG_EVERY = int(os.getenv("LOG_EVERY", "5000"))                  # log per N rows written
+# Logging cadence
+LOG_EVERY = int(os.getenv("LOG_EVERY", "5000"))                # log per N rows written
+
+# Offset reset default: “latest” for tailing new data in demos (env can override)
+AUTO_OFFSET_RESET = os.getenv("KAFKA_AUTO_OFFSET_RESET", "latest")
 
 
 _running = True
@@ -61,7 +65,7 @@ def parse_message(raw) -> Dict:
       run_id, trace_id, created_at, ts, peakspeed, pmgid, direction, location, vehiclecount, sensor_created_at
     """
     d = json.loads(raw)
-    # A tiny guard: ensure required fields exist
+    # tiny guard: ensure required fields exist
     required = ["run_id", "trace_id", "created_at", "ts", "peakspeed",
                 "pmgid", "direction", "location", "vehiclecount", "sensor_created_at"]
     for k in required:
@@ -70,24 +74,24 @@ def parse_message(raw) -> Dict:
     return d
 
 
-def flush_batch(consumer: KafkaConsumer, buffer: List[Dict], run_id: str, last_commit: int, total_written: int):
+def flush_batch(consumer: KafkaConsumer, buffer: List[Dict], run_id: str, total_written: int):
     """Write buffer to DB and commit offsets only if DB write succeeds."""
     if not buffer:
-        return last_commit, total_written
+        return total_written
 
     ingest_ts_utc = utc_now_iso_ms()
 
-    # DB write (business + latency)
+    # DB write (business + latency; single transaction inside write_batch)
     start_id, n = write_batch(run_id, ingest_ts_utc, buffer)
 
     total_written += n
-    if total_written % LOG_EVERY == 0 or n >= BATCH_ROWS:
-        print(f"[consumer] wrote {n} rows (record_id start ~{start_id}) "
+    if (total_written % LOG_EVERY == 0) or (n >= BATCH_ROWS):
+        print(f"[consumer] wrote {n} rows (record_id start≈{start_id}) "
               f"→ totals={total_written} run={run_id}", flush=True)
 
     # Only commit if DB write succeeded
     consumer.commit()
-    return 0, total_written
+    return total_written
 
 
 def main():
@@ -97,19 +101,20 @@ def main():
         TOPIC,
         bootstrap_servers=BOOTSTRAP,
         group_id=GROUP,
-        enable_auto_commit=False,            # we commit after DB success
-        auto_offset_reset=os.getenv("KAFKA_AUTO_OFFSET_RESET", "earliest"),
+        enable_auto_commit=False,               # we commit after DB success
+        auto_offset_reset=AUTO_OFFSET_RESET,    # 'latest' by default for tailing demos
         max_poll_records=MAX_POLL_RECORDS,
+        fetch_min_bytes=FETCH_MIN_BYTES,
         fetch_max_wait_ms=FETCH_MAX_WAIT_MS,
-        consumer_timeout_ms=0,               # never auto-timeout the iterator
-        value_deserializer=lambda v: v,      # we parse JSON manually
+        consumer_timeout_ms=0,                  # never auto-timeout the iterator
+        value_deserializer=lambda v: v,         # parse JSON manually
     )
 
     buffer: List[Dict] = []
     run_id_for_batch = None
-    last_flush_ms = time.time() * 1000.0
+    last_flush_ms = time.monotonic() * 1000.0   # monotonic for robustness
     total_written = 0
-    last_activity = time.time()
+    last_activity = time.monotonic()
 
     try:
         while _running:
@@ -118,11 +123,11 @@ def main():
             got = 0
 
             # Flatten the polled batches
-            for tp, records in msgs.items():
+            for _tp, records in msgs.items():
                 for rec in records:
                     try:
                         d = parse_message(rec.value)
-                        d["peakspeed"] = int(round(float(d["peakspeed"])))
+                        d["peakspeed"] = int(round(float(d["peakspeed"])))  # no decimals
                     except Exception as e:
                         print(f"[consumer] skip bad message: {e}", flush=True)
                         continue
@@ -133,32 +138,32 @@ def main():
                     buffer.append(d)
                     got += 1
 
-            now_ms = time.time() * 1000.0
+            now_ms = time.monotonic() * 1000.0
             if got > 0:
-                last_activity = time.time()
+                last_activity = time.monotonic()
 
             # Flush if big enough or time window reached
             if buffer and (len(buffer) >= BATCH_ROWS or (now_ms - last_flush_ms) >= FLUSH_MS):
                 try:
-                    _, total_written = flush_batch(consumer, buffer, run_id_for_batch, 0, total_written)
+                    total_written = flush_batch(consumer, buffer, run_id_for_batch, total_written)
                     buffer.clear()
                     run_id_for_batch = None
                     last_flush_ms = now_ms
                 except Exception as e:
                     # Do not commit; surface the error and keep running
                     print(f"[consumer] DB write failed: {e}", flush=True)
-                    time.sleep(0.25)  # small backoff
+                    time.sleep(0.25)  # tiny backoff
                     # Optionally: dead-letter to a file here
 
             # Optional auto-exit when idle and buffer empty
-            if AUTO_EXIT_IDLE_S and not buffer and (time.time() - last_activity) > AUTO_EXIT_IDLE_S:
+            if AUTO_EXIT_IDLE_S and not buffer and (time.monotonic() - last_activity) > AUTO_EXIT_IDLE_S:
                 print(f"[consumer] idle {AUTO_EXIT_IDLE_S}s → exiting cleanly.", flush=True)
                 break
 
         # Final flush on shutdown
         if buffer:
             try:
-                _, total_written = flush_batch(consumer, buffer, run_id_for_batch, 0, total_written)
+                total_written = flush_batch(consumer, buffer, run_id_for_batch, total_written)
                 print(f"[consumer] final flush {len(buffer)} rows", flush=True)
             except Exception as e:
                 print(f"[consumer] final flush failed: {e}", flush=True)

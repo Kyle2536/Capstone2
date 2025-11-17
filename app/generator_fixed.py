@@ -7,6 +7,117 @@ import random, hashlib
 from datetime import datetime, timezone, timedelta
 from tracing import new_trace
 
+
+# ---- realistic sensor placement: Poisson-disk in the Dallas box ----
+import math
+from functools import lru_cache
+
+# Dallas-ish bounding box
+LON_MIN, LON_MAX = -97.05, -96.55
+LAT_MIN, LAT_MAX =  32.60,  33.10
+BOX_COS = math.cos(math.radians(33.0))
+
+def km_to_deg_lat(km: float) -> float:
+    return km / 111.0
+
+def km_to_deg_lon(km: float) -> float:
+    return km / (111.0 * BOX_COS)
+
+def _poisson_disk_points(n_target: int, min_sep_km: float, seed: int = 4372):
+    """
+    Bridson-ish Poisson-disk sampler (simple version) in lat/lon degrees.
+    Deterministic given (n_target, min_sep_km, seed).
+    """
+    rnd = random.Random(seed)
+    min_sep_lat = km_to_deg_lat(min_sep_km)
+    min_sep_lon = km_to_deg_lon(min_sep_km)
+
+    # grid cell sizes (so neighbors are limited)
+    cell_lat = min_sep_lat / math.sqrt(2)
+    cell_lon = min_sep_lon / math.sqrt(2)
+
+    grid = {}
+    points = []
+
+    def to_cell(lat, lon):
+        i = int((lat - LAT_MIN) / cell_lat)
+        j = int((lon - LON_MIN) / cell_lon)
+        return i, j
+
+    def in_box(lat, lon):
+        return LAT_MIN <= lat <= LAT_MAX and LON_MIN <= lon <= LON_MAX
+
+    def far_enough(lat, lon):
+        ci, cj = to_cell(lat, lon)
+        # check this cell and neighbors
+        for di in (-1, 0, 1):
+            for dj in (-1, 0, 1):
+                key = (ci + di, cj + dj)
+                if key in grid:
+                    for (plat, plon) in grid[key]:
+                        dlat = (lat - plat) * 111.0
+                        dlon = (lon - plon) * 111.0 * BOX_COS
+                        if math.hypot(dlat, dlon) < min_sep_km:
+                            return False
+        return True
+
+    # seed with a random point
+    lat0 = rnd.uniform(LAT_MIN, LAT_MAX)
+    lon0 = rnd.uniform(LON_MIN, LON_MAX)
+    points.append((lat0, lon0))
+    grid[to_cell(lat0, lon0)] = [(lat0, lon0)]
+    active = [(lat0, lon0)]
+
+    k = 20  # attempts per active point
+    while active and len(points) < n_target:
+        idx = rnd.randrange(len(active))
+        plat, plon = active[idx]
+        found = False
+        for _ in range(k):
+            # pick a ring between r and 2r in deg
+            r_km = min_sep_km * (1 + rnd.random())
+            r_lat = km_to_deg_lat(r_km)
+            r_lon = km_to_deg_lon(r_km)
+            theta = rnd.uniform(0, 2*math.pi)
+            lat = plat + r_lat * math.sin(theta)
+            lon = plon + r_lon * math.cos(theta)
+            if in_box(lat, lon) and far_enough(lat, lon):
+                points.append((lat, lon))
+                active.append((lat, lon))
+                cell = to_cell(lat, lon)
+                grid.setdefault(cell, []).append((lat, lon))
+                found = True
+                break
+        if not found:
+            active.pop(idx)
+
+        # stop early if we’re close enough
+        if len(points) >= n_target:
+            break
+
+    return points
+
+@lru_cache(maxsize=8)
+def sensor_points(n_target: int = 1000, min_sep_km: float = 0.7, seed: int = 4372):
+    return _poisson_disk_points(n_target, min_sep_km, seed)
+
+def pmgid_base_lon_lat(pmgid: str, n_target: int = 1000, min_sep_km: float = 0.7, seed: int = 4372):
+    """
+    Fixed per-PMGID mapping onto precomputed Poisson-disk points (deterministic).
+    PMG00001 → points[0], PMG00002 → points[1], etc. If PMG index exceeds points,
+    we wrap around.
+    """
+    pts = sensor_points(n_target=n_target, min_sep_km=min_sep_km, seed=seed)
+    # PMG00001 → 0
+    try:
+        idx = int(pmgid[-5:]) - 1
+    except Exception:
+        idx = 0
+    lat, lon = pts[idx % len(pts)]
+    return lon, lat
+
+
+
 try:
     # Python 3.9+ standard library time zone (no extra deps)
     from zoneinfo import ZoneInfo
